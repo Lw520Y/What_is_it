@@ -17,7 +17,7 @@ python main.py
 
 ### 打包成 exe
 
-双击 `build.bat`，产物在 `dist\WhatIsIt\WhatIsIt.exe`（单文件夹，整个目录拷走即用）。
+双击 `build.bat`，产物在 `dist\WhatIsIt.exe`（单文件，无需 `_internal`，拷走即用）。
 
 ## AI 配置（可选但推荐）
 
@@ -38,6 +38,7 @@ python main.py
 | L1 目录名规则 | 内置 80+ 精确/通配规则 | `.git`→Git版本库、`node_modules`→NPM依赖 |
 | L2 特征文件 | 探测目录内的标志性文件 | `pyvenv.cfg`→Python虚拟环境（还能识别出是 uv 创建的空壳） |
 | L3 AI 分析 | 子项列表+特征文件摘要喂给 AI | AI 返回用途/置信度/删除建议，结果缓存 7 天 |
+| L4 学习规则 | AI 分析成功后按目录名自动沉淀 | 同名目录下次本地秒判，不再消耗 AI 额度 |
 
 **删除建议图例**：✅ 可安全删除 ｜ ⚠️ 谨慎删除 ｜ ⛔ 不建议删除 ｜ ❔ 无法判断
 
