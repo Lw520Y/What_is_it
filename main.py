@@ -23,7 +23,7 @@ import ai_analyzer
 import rules
 import scanner
 
-APP_NAME = "What's it? 磁盘目录侦探"
+APP_NAME = "What's it? 磁盘目录侦探 - Clash制作"
 DELETABLE_LABEL = {
     "safe": ("✅ 可安全删除", "#2e7d32"),
     "caution": ("⚠️ 谨慎删除", "#e65100"),
@@ -348,6 +348,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.resize(1280, 780)
         self._ai_pending = set()  # 批量 AI 分析中尚未返回的路径
+        self._ai_failed = set()   # 本轮分析失败的路径（用于结束时汇总提示）
         self._gate = _Gate()
         self._relay = _Relay()
         self._relay.scanResult.connect(self._on_scan_done)
@@ -712,11 +713,16 @@ class MainWindow(QMainWindow):
             new = new[:self.MAX_AI_BATCH]
             self.status.showMessage(
                 f"选中项较多，一次最多批量分析 {self.MAX_AI_BATCH} 项（其余请分批）", 8000)
-        for path in new:
+        self._ai_failed = set()
+        for idx, path in enumerate(new):
             self._ai_pending.add(path)
             cancel = threading.Event()
+            first = idx == 0
 
-            def work(path=path):
+            def work(path=path, cancel=cancel, first=first):
+                # 批量请求之间留间隔，避免连续请求触发接口限流；等待可被取消
+                if not first:
+                    cancel.wait(1.5)
                 info = ai_analyzer.analyze(path, force=False)
                 self._relay.aiResult.emit((path, info))
 
@@ -739,6 +745,8 @@ class MainWindow(QMainWindow):
     def _on_ai_done(self, payload):
         path, info = payload
         self._ai_pending.discard(path)
+        if info.get("error"):
+            self._ai_failed.add(path)
         self._update_ai_status()
         if info.get("error"):
             self.detail.show_ai_result(info)
@@ -754,7 +762,12 @@ class MainWindow(QMainWindow):
                 self.detail.show_entry(item.data(COL_NAME, ROLE_ENTRY), info)
         # 识别成功且仍是目录 → 沉淀为本地规则，下次同名目录免 AI 直接识别（文件按扩展名识别，不沉淀）
         learned = os.path.isdir(path) and rules.learn(os.path.basename(path.rstrip("\\/")), info)
-        msg = "AI 分析完成，已加入本地规则（同名目录下次直接识别）" if learned else "AI 分析完成"
+        if self._ai_failed:
+            msg = f"AI 分析完成，{len(self._ai_failed)} 项失败（常见为接口限流/超时），可稍后重试"
+        elif learned:
+            msg = "AI 分析完成，已加入本地规则（同名目录下次直接识别）"
+        else:
+            msg = "AI 分析完成"
         self.status.showMessage(msg, 5000)
 
 

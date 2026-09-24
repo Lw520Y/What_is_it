@@ -180,14 +180,28 @@ def analyze(path, force=False):
         "temperature": 0.2,
     }
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=cfg["timeout_seconds"])
-        resp.raise_for_status()
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-    except requests.exceptions.Timeout:
-        return {"error": f"AI 请求超时（{cfg['timeout_seconds']}秒），可稍后重试"}
-    except requests.exceptions.HTTPError as e:
-        return {"error": f"AI 接口返回错误: {e}（请检查 Key/模型名/余额）"}
+        # 批量分析时连续请求易触发接口限流，超时/限流自动重试（退避 2s、4s）
+        last_err = None
+        for attempt in range(3):
+            if attempt:
+                time.sleep(2 * attempt)
+            try:
+                resp = requests.post(url, headers=headers, json=payload,
+                                     timeout=cfg["timeout_seconds"])
+                resp.raise_for_status()
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
+                break
+            except requests.exceptions.Timeout:
+                last_err = f"AI 请求超时（{cfg['timeout_seconds']}秒）"
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response is not None else 0
+                # 限流与网关类临时故障值得重试；401/403 等鉴权参数错误重试无意义
+                if status not in (429, 500, 502, 503, 504):
+                    return {"error": f"AI 接口返回错误: {e}（请检查 Key/模型名/余额）"}
+                last_err = f"AI 接口限流/繁忙（HTTP {status}）"
+        else:
+            return {"error": f"{last_err}，已自动重试仍失败，多为接口限流，可稍后再试"}
     except (requests.exceptions.RequestException, KeyError, IndexError) as e:
         return {"error": f"AI 请求失败: {e}"}
 
