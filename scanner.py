@@ -55,18 +55,27 @@ def _get_volume_label(letter):
     return volume_name.value if ok and volume_name.value else ""
 
 
-def scan_dir(path):
+def _cancelled(cancel):
+    return cancel is not None and cancel.is_set()
+
+
+def scan_dir(path, cancel=None):
     """扫描目录的直接子项（不递归）。
 
-    返回: {"entries": [...], "error": None 或错误信息, "truncated": bool}
+    cancel: threading.Event，可选；置位后尽快中止并返回 cancelled 标记。
+    返回: {"entries": [...], "error": None 或错误信息, "truncated": bool, "cancelled": bool}
     entry: {"name", "path", "is_dir", "size"(文件才有), "mtime"(修改时间戳)}
     """
     entries = []
     error = None
     truncated = False
+    cancelled = False
     try:
         with os.scandir(path) as it:
             for index, entry in enumerate(it):
+                if _cancelled(cancel):
+                    cancelled = True
+                    break
                 if index >= MAX_ENTRIES:
                     truncated = True
                     break
@@ -100,24 +109,32 @@ def scan_dir(path):
 
     # 排序：目录在前，名称不区分大小写
     entries.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
-    return {"entries": entries, "error": error, "truncated": truncated}
+    return {"entries": entries, "error": error, "truncated": truncated, "cancelled": cancelled}
 
 
-def calculate_dir_size(path):
+def calculate_dir_size(path, cancel=None):
     """递归计算目录总大小与文件数（供后台线程调用，勿在UI线程直接跑）。
 
-    返回: {"size": bytes, "files": 文件数, "dirs": 目录数, "error": None或信息}
+    cancel: threading.Event，可选；置位后尽快中止并返回已累计的部分结果。
+    返回: {"size": bytes, "files": 文件数, "dirs": 目录数, "error": None或信息, "cancelled": bool}
     """
     total = 0
     file_count = 0
     dir_count = 0
     errors = 0
+    cancelled = False
     stack = [path]
     while stack:
+        if _cancelled(cancel):
+            cancelled = True
+            break
         current = stack.pop()
         try:
             with os.scandir(current) as it:
                 for entry in it:
+                    if _cancelled(cancel):
+                        cancelled = True
+                        break
                     try:
                         if entry.is_symlink():
                             continue  # 跳过符号链接防循环
@@ -130,10 +147,13 @@ def calculate_dir_size(path):
                             file_count += 1
                     except OSError:
                         errors += 1
+                if cancelled:
+                    break
         except OSError:
             errors += 1
     return {"size": total, "files": file_count, "dirs": dir_count,
-            "error": f"{errors} 个子项无法读取" if errors else None}
+            "error": f"{errors} 个子项无法读取" if errors else None,
+            "cancelled": cancelled}
 
 
 def is_windows_dir(path):

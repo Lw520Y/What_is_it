@@ -5,10 +5,12 @@
 """
 
 import os
+import queue
 import sys
+import threading
 import time
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject
+from PySide6.QtCore import Qt, QObject, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel,
@@ -49,44 +51,98 @@ def fmt_time(ts):
 
 
 # ============================================================
-# 后台线程
+# 后台任务服务（常驻守护线程）
 # ============================================================
+# 设计要点（防闪退）：
+# 1. 任务只携带路径/代际号等纯 Python 数据，后台线程绝不触碰
+#    QTreeWidgetItem 等 Qt 对象——树被 clear() 后不会有悬空引用；
+# 2. 结果经 _Relay 信号投递回主线程，主线程按路径在当前树里重新
+#    查找条目，找不到就安全丢弃；
+# 3. _Gate 代际号：每次清空树（刷新/切换盘符）自增，旧任务的
+#    迟到结果一律作废；
+# 4. 线程常驻（不再每选中一项就新建 QThread），关窗时协作式
+#    取消并 join，避免 "QThread: Destroyed while still running"
+#    触发 qFatal 直接杀死进程。
 
-class ScanWorker(QObject):
-    """目录扫描线程（懒加载子级）。"""
-    finished = Signal(dict, object)  # result, tree_item
-
-    def __init__(self, path, item):
-        super().__init__()
-        self.path, self.item = path, item
-
-    def run(self):
-        result = scanner.scan_dir(self.path)
-        self.finished.emit(result, self.item)
-
-
-class SizeWorker(QObject):
-    """目录大小计算线程。"""
-    finished = Signal(str, dict)  # path, result
-
-    def __init__(self, path):
-        super().__init__()
-        self.path = path
-
-    def run(self):
-        self.finished.emit(self.path, scanner.calculate_dir_size(self.path))
+class _Relay(QObject):
+    """工作线程 → 主线程的结果中转（跨线程信号自动排队投递）。"""
+    scanResult = Signal(object)  # (gen, path, is_root, result, rows)
+    sizeResult = Signal(object)  # (gen, path, result)
+    aiResult = Signal(object)    # (path, info)
 
 
-class AiWorker(QObject):
-    """AI 分析线程。"""
-    finished = Signal(str, dict)  # path, result
+class _Gate:
+    """代际号：每清空一次树自增，用于作废在途任务的结果。"""
 
-    def __init__(self, path, force):
-        super().__init__()
-        self.path, self.force = path, force
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._gen = 0
 
-    def run(self):
-        self.finished.emit(self.path, ai_analyzer.analyze(self.path, force=self.force))
+    def bump(self):
+        with self._lock:
+            self._gen += 1
+            return self._gen
+
+    def current(self):
+        with self._lock:
+            return self._gen
+
+
+class _Task:
+    __slots__ = ("run", "cancel")
+
+    def __init__(self, run, cancel):
+        self.run = run
+        self.cancel = cancel
+
+
+class _Service:
+    """常驻工作线程池，顺序执行同类任务（扫描/AI 单线程，大小计算 3 线程）。"""
+
+    def __init__(self, name, workers=1):
+        self._q = queue.Queue()
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._current = set()  # 正在执行的任务，关窗时统一取消
+        self._threads = [threading.Thread(target=self._run, name=f"{name}-{i}", daemon=True)
+                         for i in range(workers)]
+        for t in self._threads:
+            t.start()
+
+    def submit(self, task):
+        if not self._stop.is_set():
+            self._q.put(task)
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                task = self._q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            with self._lock:
+                self._current.add(task)
+            try:
+                if not self._stop.is_set():
+                    task.run()
+            finally:
+                with self._lock:
+                    self._current.discard(task)
+
+    def shutdown(self, timeout=2.0):
+        """停止接单、取消排队与在跑任务、等待线程退出。"""
+        self._stop.set()
+        while True:
+            try:
+                self._q.get_nowait().cancel.set()
+            except queue.Empty:
+                break
+        with self._lock:
+            current = list(self._current)
+        for task in current:
+            task.cancel.set()
+        deadline = time.time() + timeout
+        for t in self._threads:
+            t.join(max(0.0, deadline - time.time()))
 
 
 # ============================================================
@@ -291,7 +347,14 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.resize(1280, 780)
-        self._threads = []  # 持有线程引用防GC
+        self._gate = _Gate()
+        self._relay = _Relay()
+        self._relay.scanResult.connect(self._on_scan_done)
+        self._relay.sizeResult.connect(self._on_size_done)
+        self._relay.aiResult.connect(self._on_ai_done)
+        self._scan_svc = _Service("scan")
+        self._size_svc = _Service("size", workers=3)
+        self._ai_svc = _Service("ai")
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -412,44 +475,52 @@ class MainWindow(QMainWindow):
     def _open_settings(self):
         SettingsDialog(self).exec()
 
+    def closeEvent(self, event):
+        # 关窗时作废所有在途任务并等后台线程退出，
+        # 避免线程仍在运行时对象被销毁导致进程被 qFatal 杀死（闪退）
+        self._gate.bump()
+        for svc in (self._scan_svc, self._size_svc, self._ai_svc):
+            svc.shutdown()
+        super().closeEvent(event)
+
     # ---------------- 树扫描/交互 ----------------
 
     def _scan_into(self, parent_item, path, is_root=False):
-        """后台扫描 path 的子项，填充到 parent_item。parent_item 为 QTreeWidget 时表示根。"""
+        """后台扫描 path 的子项，完成后填充到 parent_item。parent_item 为 QTreeWidget 时表示根。"""
         self.status.showMessage(f"正在扫描 {path} ...")
         if is_root:
             self._root_scanning = True
+            self._gate.bump()  # 作废此前所有在途扫描/大小任务
             self.tree.clear()
         else:
             parent_item.setData(COL_NAME, ROLE_SCANNED, True)
+        gen = self._gate.current()
+        cancel = threading.Event()
 
-        thread = QThread(self)
-        worker = ScanWorker(path, parent_item)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_scan_done)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(lambda t=thread: self._cleanup_thread(t))
-        self._threads.append((thread, worker))  # 双引用防GC
-        thread.start()
+        def work():
+            result = scanner.scan_dir(path, cancel=cancel)
+            rows = []
+            if not result.get("error") and not result.get("cancelled"):
+                # 识别放在后台线程做，避免大量目录的规则探测卡住界面
+                for entry in result["entries"]:
+                    info = rules.identify(entry["path"], entry["name"], entry["is_dir"])
+                    rows.append((entry, info))
+            self._relay.scanResult.emit((gen, path, is_root, result, rows))
 
-    def _cleanup_thread(self, thread):
-        self._threads = [(t, w) for t, w in self._threads if t is not thread]
+        self._scan_svc.submit(_Task(work, cancel))
 
-    def _on_scan_done(self, result, parent_item):
-        is_root = isinstance(parent_item, QTreeWidget)
+    def _on_scan_done(self, payload):
+        gen, path, is_root, result, rows = payload
         if is_root:
             self._root_scanning = False
+        if gen != self._gate.current() or result.get("cancelled"):
+            return  # 结果已过期（期间刷新/切换过目录）或被取消，安全丢弃
         if result.get("error"):
             self.status.showMessage(f"扫描失败: {result['error']}")
             return
 
-        entries = result["entries"]
         items = []
-        for entry in entries:
-            info = rules.identify(entry["path"], entry["name"], entry["is_dir"])
+        for entry, info in rows:
             item = QTreeWidgetItem([entry["name"], fmt_size(entry["size"]),
                                     fmt_time(entry["mtime"]), info["purpose"] if info else ""])
             item.setData(COL_NAME, ROLE_ENTRY, entry)
@@ -470,8 +541,11 @@ class MainWindow(QMainWindow):
             self.tree.addTopLevelItems(items)
             count = self.tree.topLevelItemCount()
         else:
-            parent_item.addChildren(items)
-            count = parent_item.childCount()
+            parent = self._find_item_by_path(self.tree.invisibleRootItem(), path)
+            if parent is None:
+                return  # 节点已随树清空被移除，丢弃结果
+            parent.addChildren(items)
+            count = parent.childCount()
         self.status.showMessage(f"扫描完成，共 {count} 项", 5000)
 
     def _on_item_expanded(self, item):
@@ -512,9 +586,11 @@ class MainWindow(QMainWindow):
             return
         info = item.data(COL_NAME, ROLE_INFO)
         self.detail.show_entry(entry, info)
-        # 文件夹且未算大小：后台算
-        if entry["is_dir"]:
-            self._start_size_calc(item, entry["path"])
+        # 文件夹且未算大小：后台算；滑动多选时对每个选中项排队（已算过的自动跳过）
+        for it in items:
+            e = it.data(COL_NAME, ROLE_ENTRY)
+            if e and e["is_dir"]:
+                self._start_size_calc(it, e["path"])
 
     def _selected_path(self):
         items = self.tree.selectedItems()
@@ -530,20 +606,20 @@ class MainWindow(QMainWindow):
             return
         item.setData(COL_SIZE, ROLE_SCANNED, True)
         item.setText(COL_SIZE, "计算中…")
-        thread = QThread(self)
-        worker = SizeWorker(path)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_size_done)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(lambda t=thread: self._cleanup_thread(t))
-        self._threads.append((thread, worker))
-        thread.start()
+        gen = self._gate.current()
+        cancel = threading.Event()
 
-    def _on_size_done(self, path, result):
-        # 在树中找该项（可能已切换目录）
+        def work():
+            result = scanner.calculate_dir_size(path, cancel=cancel)
+            self._relay.sizeResult.emit((gen, path, result))
+
+        self._size_svc.submit(_Task(work, cancel))
+
+    def _on_size_done(self, payload):
+        gen, path, result = payload
+        if gen != self._gate.current() or result.get("cancelled"):
+            return  # 结果已过期或被取消
+        # 在当前树中找该项（可能已切换目录）
         item = self._find_item_by_path(self.tree.invisibleRootItem(), path)
         if item:
             item.setText(COL_SIZE, fmt_size(result["size"]))
@@ -590,19 +666,16 @@ class MainWindow(QMainWindow):
         self.detail.btn_ai.setText("🤖 AI 分析中…")
         self.detail.btn_ai.setEnabled(False)
         self.status.showMessage(f"AI 正在分析 {path} ...")
-        thread = QThread(self)
-        worker = AiWorker(path, force=False)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_ai_done)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(lambda t=thread: self._cleanup_thread(t))
-        self._threads.append((thread, worker))
-        thread.start()
+        cancel = threading.Event()
 
-    def _on_ai_done(self, path, info):
+        def work():
+            info = ai_analyzer.analyze(path, force=False)
+            self._relay.aiResult.emit((path, info))
+
+        self._ai_svc.submit(_Task(work, cancel))
+
+    def _on_ai_done(self, payload):
+        path, info = payload
         self.detail.btn_ai.setText("🤖 AI 深度分析")
         self.detail.btn_ai.setEnabled(True)
         if info.get("error"):
