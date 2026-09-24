@@ -14,7 +14,7 @@ from PySide6.QtCore import Qt, QObject, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFormLayout, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
     QSplitter, QStackedWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
     QFileDialog, QGroupBox,
 )
@@ -347,6 +347,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.resize(1280, 780)
+        self._ai_pending = set()  # 批量 AI 分析中尚未返回的路径
         self._gate = _Gate()
         self._relay = _Relay()
         self._relay.scanResult.connect(self._on_scan_done)
@@ -396,6 +397,8 @@ class MainWindow(QMainWindow):
         self.tree.setAlternatingRowColors(True)
         self.tree.itemExpanded.connect(self._on_item_expanded)
         self.tree.itemSelectionChanged.connect(self._on_item_selected)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         splitter.addWidget(self.tree)
 
         self.detail = DetailPanel()
@@ -599,6 +602,42 @@ class MainWindow(QMainWindow):
         entry = items[0].data(COL_NAME, ROLE_ENTRY)
         return entry["path"] if entry else None
 
+    def _on_tree_context_menu(self, pos):
+        item = self.tree.itemAt(pos)
+        if item is None:
+            return
+        entry = item.data(COL_NAME, ROLE_ENTRY)
+        if entry is None:
+            return  # 占位行（如“条目过多”提示）
+        # 右键联动选中：落在既有选区内保留多选（便于批量分析），否则单选该项
+        if not item.isSelected():
+            self.tree.setCurrentItem(item)
+
+        selected = [it.data(COL_NAME, ROLE_ENTRY) for it in self.tree.selectedItems()]
+        selected = [e for e in selected if e]
+        if len(selected) > 1:
+            ai_paths = [e["path"] for e in selected]
+            ai_label = f"🤖 AI 深度分析（{len(ai_paths)} 项）"
+        else:
+            ai_paths = [entry["path"]]
+            ai_label = "🤖 AI 深度分析"
+
+        menu = QMenu(self.tree)
+        act_ai = menu.addAction(ai_label)
+        act_open = menu.addAction("📂 在资源管理器打开")
+        act_copy = menu.addAction("📋 复制路径")
+        chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+        if chosen is act_ai:
+            self._start_ai(ai_paths)
+        elif chosen is act_open:
+            try:
+                os.startfile(entry["path"])  # noqa  Windows 专用
+            except OSError:
+                self.status.showMessage(f"无法打开: {entry['path']}", 5000)
+        elif chosen is act_copy:
+            QApplication.clipboard().setText(entry["path"])
+            self.status.showMessage("路径已复制", 3000)
+
     # ---------------- 大小计算 ----------------
 
     def _start_size_calc(self, item, path):
@@ -649,8 +688,14 @@ class MainWindow(QMainWindow):
 
     # ---------------- AI ----------------
 
-    def _start_ai(self, path):
-        if not path:
+    MAX_AI_BATCH = 20  # 一次批量分析的条目上限，防止误全选触发海量请求
+
+    def _start_ai(self, paths):
+        """paths: 单个路径 str 或路径列表（批量）。已在分析中的路径自动跳过。"""
+        if isinstance(paths, str):
+            paths = [paths]
+        new = [p for p in paths if p and p not in self._ai_pending]
+        if not new:
             return
         cfg = ai_analyzer.load_config()
         if not cfg.get("api_key"):
@@ -663,21 +708,38 @@ class MainWindow(QMainWindow):
                     return
             else:
                 return
-        self.detail.btn_ai.setText("🤖 AI 分析中…")
-        self.detail.btn_ai.setEnabled(False)
-        self.status.showMessage(f"AI 正在分析 {path} ...")
-        cancel = threading.Event()
+        if len(new) > self.MAX_AI_BATCH:
+            new = new[:self.MAX_AI_BATCH]
+            self.status.showMessage(
+                f"选中项较多，一次最多批量分析 {self.MAX_AI_BATCH} 项（其余请分批）", 8000)
+        for path in new:
+            self._ai_pending.add(path)
+            cancel = threading.Event()
 
-        def work():
-            info = ai_analyzer.analyze(path, force=False)
-            self._relay.aiResult.emit((path, info))
+            def work(path=path):
+                info = ai_analyzer.analyze(path, force=False)
+                self._relay.aiResult.emit((path, info))
 
-        self._ai_svc.submit(_Task(work, cancel))
+            self._ai_svc.submit(_Task(work, cancel))
+        self._update_ai_status()
+        if len(new) == 1:
+            self.status.showMessage(f"AI 正在分析 {new[0]} ...")
+        else:
+            self.status.showMessage(f"AI 正在批量分析 {len(new)} 项，逐项进行中 ...")
+
+    def _update_ai_status(self):
+        n = len(self._ai_pending)
+        if n:
+            self.detail.btn_ai.setText(f"🤖 AI 分析中…（剩 {n}）")
+            self.detail.btn_ai.setEnabled(False)
+        else:
+            self.detail.btn_ai.setText("🤖 AI 深度分析")
+            self.detail.btn_ai.setEnabled(True)
 
     def _on_ai_done(self, payload):
         path, info = payload
-        self.detail.btn_ai.setText("🤖 AI 深度分析")
-        self.detail.btn_ai.setEnabled(True)
+        self._ai_pending.discard(path)
+        self._update_ai_status()
         if info.get("error"):
             self.detail.show_ai_result(info)
             self.status.showMessage(f"AI 分析失败: {info['error']}", 8000)

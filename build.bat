@@ -1,10 +1,21 @@
 @echo off
-chcp 65001 >nul
+rem ¹Ì¶¨¹¤×÷Ä¿Â¼Îª½Å±¾ËùÔÚÄ¿Â¼£¨ÒÔ¹ÜÀíÔ±Éí·İÔËĞĞÊ±Ä¬ÈÏÔÚ System32£©
+cd /d "%~dp0"
+
 echo ============================================
-echo  What's it? ç£ç›˜ç›®å½•ä¾¦æ¢ - æ‰“åŒ…è„šæœ¬
+echo  What's it? ´ÅÅÌÄ¿Â¼ÕìÌ½ - ´ò°ü½Å±¾
 echo ============================================
 
+rem ÕıÔÚÔËĞĞµÄ WhatIsIt »áËø×¡ dist ÀïµÄ exe£¬ÏÈ½áÊøËüÔÙ´ò°ü
+taskkill /f /im WhatIsIt.exe >nul 2>&1
+
 pip install pyinstaller >nul 2>&1
+where pyinstaller >nul 2>&1
+if errorlevel 1 (
+    echo ¡Á Î´ÕÒµ½ pyinstaller£ºÇëÈ·ÈÏÒÑ°²×° Python ²¢Ö´ĞĞ pip install pyinstaller
+    pause
+    exit /b 1
+)
 
 pyinstaller --noconfirm --clean --onefile --windowed ^
   --name "WhatIsIt" ^
@@ -12,10 +23,15 @@ pyinstaller --noconfirm --clean --onefile --windowed ^
   main.py
 
 echo.
+if errorlevel 1 (
+    echo ¡Á ´ò°üÊ§°Ü£ºÇë²é¿´ÉÏ·½´íÎóĞÅÏ¢¡£³£¼ûÔ­Òò£ºÉ±¶¾Èí¼şÀ¹½Ø¡¢Python »·¾³Òì³£
+    pause
+    exit /b 1
+)
 if exist "dist\WhatIsIt.exe" (
-    echo âœ… æ‰“åŒ…æˆåŠŸ: dist\WhatIsIt.exeï¼ˆå•æ–‡ä»¶ï¼Œæ— éœ€ _internalï¼‰
+    echo ¡Ì ´ò°ü³É¹¦: dist\WhatIsIt.exe£¨µ¥ÎÄ¼ş£¬ÎŞĞè _internal£©
     explorer /select,"dist\WhatIsIt.exe"
 ) else (
-    echo âŒ æ‰“åŒ…å¤±è´¥ï¼Œè¯·æ£€æŸ¥ä¸Šæ–¹é”™è¯¯ä¿¡æ¯
+    echo ¡Á ´ò°üÊ§°Ü£ºdist ÀïÃ»ÓĞÉú³É WhatIsIt.exe£¬Çë²é¿´ÉÏ·½´íÎóĞÅÏ¢
 )
 pause
